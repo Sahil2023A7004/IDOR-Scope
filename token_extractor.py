@@ -1,6 +1,6 @@
-# Automatically finds how each user logs in (Bearer token or Cookie),
-# Decodes JWT claims if present, and scans response bodies for personal
-# data like emails, usernames, and phone numbers to prove data leaks.
+#Automatically finds how each user logs in using a Bearer token or Cookie.
+#Decodes JWT claims if present and scans response bodies for personal
+#data like emails, usernames, and phone numbers to prove data leaks.
 
 import re
 import json
@@ -10,133 +10,134 @@ from collections import Counter
 EMAIL = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 PHONE = re.compile(r"\b\d{9,12}\b")
 
-PERSONAL_KEYS = {"username", "user_name", "login", "handle", "display_name",
-                 "name", "full_name", "first_name", "last_name", "email",
-                 "phone", "mobile", "user_id", "account_id", "id"}
+PERSONAL_KEYS = {
+    "username", "user_name", "login", "handle", "display_name",
+    "full_name", "first_name", "last_name", "email",
+    "phone", "mobile", "user_id", "account_id",
+}
+
+MAX_WALK_DEPTH = 30                                                  #Stop recursion at 30 levels deep so huge JSON files never crash RAM
 
 
-def decode_base64(text): #Safely decode base64url with padding fix
+def decode_base64(text):                                             #Decode base64 text safely into readable words
     remainder = len(text) % 4
     if remainder > 0:
-        text += "=" * (4 - remainder) #Base64 requires length divisible by 4
+        text += "=" * (4 - remainder)                                #Add equals signs at the end so length divides by 4
     try:
         return base64.urlsafe_b64decode(text.encode("utf-8")).decode("utf-8", errors="ignore")
     except Exception:
-        return ""
+        return ""                                                    #If decoding fails return an empty string instead of crashing
 
 
-def extract_auth(requests): #Find login method from captured traffic automatically
-    tokens = [] #Collect all Bearer tokens seen
-    cookies = [] #Collect all Cookie headers seen
+def extract_auth(requests):                                          #Find the user login credential automatically from traffic
+    tokens = []                                                      #List to store all Bearer tokens found
+    cookies = []                                                     #List to store all Cookies found
 
-    for req in requests: #Loop through every request in the clean list
-        headers = req.get("headers", {}) #Get the flat header dictionary
+    for req in requests:                                             #Loop through every clean request
+        headers = req.get("headers", {})                             #Get the request headers dictionary
 
-        auth = headers.get("authorization", "") #Check for Authorization header
-        if auth.startswith("Bearer "): #If it starts with Bearer it is a token
-            tokens.append(auth[len("Bearer "):].strip()) #Strip the word Bearer and save
+        auth = headers.get("authorization", "")                      #Look for the authorization header
+        if auth.startswith("Bearer "):                               #Check if it uses a Bearer token
+            tokens.append(auth[len("Bearer "):].strip())             #Remove the word Bearer and save the token
 
-        cookie = headers.get("cookie", "") #Check for Cookie header
-        if cookie: #If cookie exists
-            cookies.append(cookie.strip()) #Save it
+        cookie = headers.get("cookie", "")                           #Look for the cookie header
+        if cookie:                                                   #Check if a cookie exists
+            cookies.append(cookie.strip())                           #Save the cookie string
 
-    if tokens: #If we found Bearer tokens
-        winner = Counter(tokens).most_common(1)[0][0] #Pick the most frequently used one
-        return {"type": "bearer", "value": winner}
+    if tokens:                                                       #If Bearer tokens were found prefer them first
+        winner = Counter(tokens).most_common(1)[0][0]                #Pick the token used most often
+        return {"type": "bearer", "value": winner}                   #Return token type and value to RAM
 
-    if cookies: #If no tokens but cookies exist
-        winner = Counter(cookies).most_common(1)[0][0] #Pick the most frequently used one
-        return {"type": "cookie", "value": winner}
+    if cookies:                                                      #If no Bearer token exists use the session cookie
+        winner = Counter(cookies).most_common(1)[0][0]               #Pick the cookie used most often
+        return {"type": "cookie", "value": winner}                   #Return cookie type and value to RAM
 
-    return None #No auth found at all
+    return None                                                      #If neither exists return None
 
 
-def extract_bearer_token(requests): #Backward compatibility for original engine calls
+def extract_bearer_token(requests):                                  #Helper function that returns only a Bearer token string
     auth = extract_auth(requests)
     if auth and auth["type"] == "bearer":
         return auth["value"]
     return None
 
 
-def claims_from_jwt(token): #Decode JWT payload and extract identity claims
+def claims_from_jwt(token):                                          #Open up a JWT token and pull out user identity info
     if not token or not isinstance(token, str):
         return set()
 
-    parts = token.split(".") #JWT has 3 parts separated by dots
-    if len(parts) != 3: #If it does not have 3 sprate parts, it is not a JWT
+    parts = token.split(".")                                         #Split token by dots since JWT has 3 parts
+    if len(parts) != 3:                                              #If it does not have 3 parts it is not a JWT
         return set()
 
-    payload_text = decode_base64(parts[1]) #Decode the middle segment (payload)
+    payload_text = decode_base64(parts[1])                           #Decode the middle part which holds user data
     try:
-        payload = json.loads(payload_text) #Parse JSON from decoded text
+        payload = json.loads(payload_text)                           #Convert decoded text into a Python dictionary
     except (json.JSONDecodeError, TypeError):
         return set()
 
-    claims = set() #Collect identity values found
+    claims = set()                                                   #Create a set to store unique identity values
     for key in ("sub", "email", "username", "preferred_username", "name"):
-        val = payload.get(key) #Check if this claim exists in the payload
-        if val and isinstance(val, (str, int)): #If it exists and is a real value
-            claims.add(str(val)) #Add it to our identity set
-    return claims
+        val = payload.get(key)                                       #Check if this field exists inside the JWT
+        if val and isinstance(val, (str, int)):
+            claims.add(str(val))                                     #Save the value as a string
+    return claims                                                    #Return all extracted JWT identity values
 
 
-def extract_identity_values(requests): #Scan response bodies for personal data
-    found = set() #Store identity values
+def extract_identity_values(requests):                               #Scan server responses for user personal data
+    found = set()                                                    #Set to store unique personal values for this user
 
-    for req in requests: #Loop through every request
-        body = req.get("response_body") #Get the server response text
-        if not body: #If empty skip
+    for req in requests:                                             #Loop through every captured request
+        body = req.get("response_body")                              #Get the response text sent by the server
+        if not body:                                                 #If response is empty skip it
             continue
 
-        for match in EMAIL.findall(body): #Find all email addresses in response
+        for match in EMAIL.findall(body):                            #Find any email addresses in the text
             found.add(match)
-        for match in PHONE.findall(body): #Find all phone numbers in response
+        for match in PHONE.findall(body):                            #Find any phone numbers in the text
             found.add(match)
 
-        try: #Try to parse response as JSON for structured field extraction
-            parsed = json.loads(body)
-            walk_json(parsed, found) #Walk through nested JSON pulling personal fields
+        try:
+            parsed = json.loads(body)                                #Try to convert response text into a JSON object
+            walk_json(parsed, found)                                 #Search inside the JSON for personal fields
         except (json.JSONDecodeError, TypeError):
-            continue
+            continue                                                 #If response is not JSON move to the next request
 
-    return found
+    return found                                                     #Return all personal values belonging to this user
 
 
-def walk_json(data, collected): #Recursively walk JSON to find personal field values
-    if isinstance(data, dict): #If current level is a dictionary
-        for key, val in data.items(): #Check each key value pair
+def walk_json(data, collected, depth=0):                             #Step through nested JSON to grab personal field values
+    if depth > MAX_WALK_DEPTH:                                       #Stop if nesting goes deeper than 30 levels
+        return
+    if isinstance(data, dict):                                       #If current item is a JSON dictionary
+        for key, val in data.items():                                #Check every key and value pair
             if key.lower() in PERSONAL_KEYS and isinstance(val, (str, int)):
                 text = str(val).strip()
-                if text and len(text) > 1: #Skip empty or single char values like "0"
-                    collected.add(text) #Add to identity collection
-            walk_json(val, collected) #Go deeper into nested structures
-    elif isinstance(data, list): #If current level is a list
-        for item in data: #Check each item
-            walk_json(item, collected) #Go deeper and keep recursively doing it until it meets the required condition
+                if text and len(text) > 1:                           #Ignore empty values or single characters like 0
+                    collected.add(text)                              #Save the personal value
+            walk_json(val, collected, depth + 1)                     #Step deeper into nested objects
+    elif isinstance(data, list):                                     #If current item is a JSON list
+        for item in data:                                            #Check every item in the list
+            walk_json(item, collected, depth + 1)                    #Step deeper into the list item
 
 
-# Libraries Used:
-# re (builtin) provides regex patterns to find emails and phone numbers in text
-# json (builtin) parses JSON response bodies and JWT payloads
-# base64 (builtin) decodes the middle segment of JWT tokens
-# Counter (from collections) counts occurrences to find most common token or cookie
+# re.compile builds a search pattern in RAM to quickly spot emails and phone numbers
+# base64.urlsafe b64decode translates encoded JWT text back into readable characters
+# Counter counts how many times each token or cookie appears so we pick the active session
 
 # Variables Used:
-# tokens: collects every Bearer token string seen across all requests
-# cookies: collects every Cookie header string seen across all requests
-# winner: is the most frequently used token or cookie (the real session credential)
-# found: is the set that accumulates all personal data values (emails phones usernames)
-# claims: is the set of identity values extracted from inside a JWT payload
-# parsed: is a JSON response body converted from text into Python dictonries and lists
+
+# PERSONAL KEYS holds specific account field names like username email and account id
+# Generic words like id and name are excluded from PERSONAL KEYS so product names do not cause false alerts
+# MAX WALK DEPTH limits how deep walk json can go so deeply nested data never crashes Python
+# tokens and cookies store all credentials seen across the user traffic
+# winner stores the single most frequent credential used by that user
+# found and claims store the personal identity strings that belong to the user
 
 # Working:
-# engine.py calls extract auth with the clean request list from har loader
-# extract auth loops through every request checking headers for Bearer or Cookie
-# The most common credential is returned as a typed dict (type and value)
-# engine.py then calls claims from jwt on the token to get user ID email etc from JWT
-# engine.py also calls extract identity values which scans all response bodies
-# It uses regex to find emails and phones in raw text
-# Then parses JSON responses and walks through nested structures
-# Looking for keys like username, full name, account id
-# All found values are merged into one identity set per user
-# This identity set is later used by classifier to prove a leak is real
+
+# engine calls extract auth to find whether the user logs in with a Bearer token or Cookie
+# If a JWT Bearer token is found claims from jwt decodes its middle section to grab user IDs and emails
+# Next extract identity values scans all response bodies using regex and walk json
+# It collects account specific values like emails phone numbers and usernames into a set
+# This identity set is passed to classifier so it can tell if User A data leaks into User B responses
