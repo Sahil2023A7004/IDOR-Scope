@@ -1,155 +1,170 @@
-# IDOR-Scope: Automated Broken Access Control Detection Engine
+# IDOR Scope: Automated Access Control Security Assessment Framework
 
-An automated access control audit engine based on the IEEE S&P 2025 paper:
-> *"403 Forbidden? Ethically Evaluating Broken Access Control in the Wild"* (VSF Paper)
+An automated security assessment engine designed to detect and validate Insecure Direct Object Reference vulnerabilities across modern web applications.
 
-IDOR-Scope solves the open research problem identified in Section 8.2 of the paper: automating the semantic classification of successful (`200 OK`) responses to determine whether an IDOR (Insecure Direct Object Reference) data leak genuinely occurred, rather than requiring human inspection.
-
----
-
-## 1. How the Engine Works
-
-```
-alice.har  +  bob.har
-       │
-       ▼
- [har_loader.py]      1. Ingests raw browser archives and strips noise (.png, .css, trackers).
-       │
-       ▼
-[token_extractor.py]  2. Auto-detects auth method (Bearer token OR session Cookie),
-       │                 decodes JWT identity claims without a signing key, and
-       │                 builds a baseline identity profile (usernames, emails, IDs).
-       ▼
-  [matcher.py]        3. Aligns corresponding endpoints between users and identifies
-       │                 differing parameters in URL paths, query strings, and JSON bodies.
-       │
-       ├─── GET (Read Endpoints) ──────┐
-       │                               ▼
-       │                         [prober.py]       4. Replays requests with swapped IDs
-       │                               │              forwarding browser headers for WAF bypass.
-       │                               ▼
-       │                       [classifier.py]     5. Engine 1: Evaluates leaks via a 4-signal
-       │                                              cascade (Status → Disguised Error →
-       │                                              Value Provenance → Personal Field Diff).
-       │
-       └─── POST/PUT/DELETE ───────────┐
-                                       ▼
-                              [action_verifier.py] 6. Engine 2: Verifies state mutation via
-                                                      before-and-after resource snapshots.
-       │
-       ▼
- findings.json  +  Terminal Summary Table
-```
+Based on the research paper:
+> 403 Forbidden? Ethically Evaluating Broken Access Control in the Wild (IEEE S&P 2025)
 
 ---
 
-## 2. Environment & Prerequisites (Kali Linux)
+## Executive Overview
 
-IDOR-Scope requires **Python 3.8+**. It deliberately relies almost entirely on the Python Standard Library (`json`, `urllib`, `re`, `base64`, `dataclasses`, `argparse`), requiring only the `requests` HTTP library.
+Section 8.2 of the Vulnerability Scan Framework paper explicitly left the semantic interpretation of HTTP 200 OK responses as an open research challenge. Web servers frequently return status 200 OK even when requests are denied, or conversely, return 200 OK with data belonging to other accounts.
 
-### Step 1: Install System Dependencies
-In your Kali terminal, ensure Python's virtual environment package is installed:
+IDOR Scope automates this deep semantic verification. By ingesting browser network session recordings from two test accounts, the framework correlates identical endpoints, swaps object identifiers, retransmits requests while preserving browser fingerprinting, and applies an automated dual engine classifier to definitively prove data disclosure and unauthorized state modification.
+
+---
+
+## Architectural Pipeline
+
+```
+User A Session  +  User B Session
+       │
+       ▼
+ [ Har Loader ]       1. Ingests network archives and eliminates static asset noise (.png, .css).
+       │
+       ▼
+[ Token Extractor ]   2. Auto detects Bearer tokens or Session Cookies, decodes JWT identity
+       │                 claims without private keys, and builds a baseline user profile.
+       ▼
+   [ Matcher ]        3. Discovers equivalent endpoints and locates differing parameters
+       │                 inside URL paths, query parameters, and JSON request bodies.
+       │
+       ├─── Read Endpoints (GET) ──────┐
+       │                               ▼
+       │                          [ Prober ]        4. Dispatches swapped requests while
+       │                               │               forwarding browser headers for WAF bypass.
+       │                               ▼
+       │                         [ Classifier ]     5. Engine 1: Evaluates data leaks through
+       │                                               a four signal decision cascade.
+       │
+       └─── Action Endpoints ──────────┐
+       |    (POST, PUT, DELETE)        ▼
+       |                      [ Action Verifier ]   6. Engine 2: Verifies unauthorized mutations
+       |                                               using pre and post state snapshots.
+       │
+       ▼
+ Structured Findings Report (JSON) + Terminal Summary Table
+```
+
+---
+
+## Operating Environment and Prerequisites
+
+The system is tested for Kali Linux, Debian, and Ubuntu environments running Python 3.8 or newer.
+
+The design relies entirely on the Python Standard Library for parsing, data structures, and networking logic, requiring only a single external HTTP library.
+
+### Step 1: Install Operating System Packages
+Open terminal and update repository lists:
 ```bash
 sudo apt update && sudo apt install -y python3-venv python3-pip
 ```
 
-### Step 2: Clone or Navigate to the Project Folder
+### Step 2: Navigate to Project Directory
 ```bash
-cd /path/to/idor-scope
+cd /path/to/files
 ```
 
-### Step 3: Create and Activate a Virtual Environment
+### Step 3: Configure Virtual Environment
+Create and activate an isolated Python environment:
 ```bash
-# Create the virtual environment named myenv
 python3 -m venv myenv
-
-# Activate the virtual environment
 source myenv/bin/activate
 ```
-*(Your terminal prompt will now show `(myenv)`).*
+The terminal prompt will display (myenv) indicating the environment is active.
 
-### Step 4: Install Required Packages
+### Step 4: Install Dependencies
+Install the required HTTP library:
 ```bash
 pip install requests
 ```
 
 ---
 
-## 3. Gathering Input Data (Capturing HAR Files)
+## Capturing Input Traffic
 
-The engine requires two `.har` network archives recorded from two separate test accounts (e.g., User A and User B) performing identical or similar actions on the target application:
+The engine operates on two HTTP Archive (HAR) files captured from test accounts you control:
 
-1. Open your browser (Firefox, Chromium, or Chrome in Kali).
-2. Open **Developer Tools** (`F12` or `Ctrl + Shift + I`) and switch to the **Network** tab.
-3. Check the **Preserve log** checkbox.
-4. Log in as **User A (Alice)** and browse the application (visit profiles, documents, orders).
-5. Right-click anywhere in the Network request list and select **"Save All As HAR"**. Save it as `alice.har`.
-6. Log out, or open a private window, and repeat the exact same browsing workflow as **User B (Bob)**. Save this capture as `bob.har`.
-7. Move `alice.har` and `bob.har` into your `idor-scope` project folder.
+1. Open your browser in Kali (Firefox or Chromium) and open Developer Tools by pressing F12.
+2. Select the Network panel and enable the checkbox marked Preserve log.
+3. Authenticate as User A (Alice) and perform typical application tasks such as browsing profile data, viewing documents, and checking settings.
+4. Right click any entry within the Network log table and click Save All As HAR. Save this file as alice.har.
+5. Open an incognito or private window, authenticate as User B (Bob), and execute the same sequence of actions. Save this file as bob.har.
+6. Transfer both alice.har and bob.har directly into your project folder.
 
 ---
 
-## 4. Running the Engine
+## Execution Procedures
 
-### A. Run Automated Unit & Integration Tests
-Before testing live captures, verify all components are operating correctly:
+### 1. Verification Test Run
+Verify all internal logic and the mock HTTP pipeline before evaluating live targets:
 ```bash
-python3 test_suite.py
+python3 test-suite.py
 ```
-*(All 46 unit and mock integration checks should pass).*
-
-### B. Standard Audit (Read Endpoints)
-Run the engine against the two captured session files:
-```bash
-python3 engine.py alice.har bob.har
+Expected terminal outcome:
+```
+Results: 46 Passed, 0 Failed
+ALL TESTS PASSED! Project is fully functional.
 ```
 
-### C. Verbose Mode (Detailed Assessment Trace)
-To view real-time decision logging for every evaluated endpoint:
+### 2. Standard Read Endpoint Assessment
+Evaluates read requests to identify unauthorized data disclosure:
 ```bash
 python3 engine.py alice.har bob.har -v
 ```
 
-### D. Audit State-Changing Endpoints (POST / PUT / PATCH / DELETE)
-> **Warning**: This performs the real action against your test account resources to verify state mutation. Only run this against test accounts you control.
+### 3. Comprehensive Assessment (Read and State Actions)
+Includes evaluation of state modifying methods (POST, PUT, PATCH, DELETE). Engine 2 verifies whether server state on User B data was mutated by requests originating from User A:
 ```bash
 python3 engine.py alice.har bob.har -v --test-actions
 ```
 
-### E. Custom Report File
-Specify a custom destination for the structured JSON report:
+### 4. Custom Output Reporting
+Outputs full diagnostic logs, swapped parameters, and classification evidence into a designated JSON file:
 ```bash
-python3 engine.py alice.har bob.har --report audit_results.json
+python3 engine.py alice.har bob.har -v --test-actions --report report.json
 ```
 
 ---
 
-## 5. Interpreting Verdict Labels
+## Terminal Command Reference
 
-| Verdict | Meaning |
+| Command Flag | Description |
 |---|---|
-| `confirmed_leak` | High-confidence finding: Victim private data was returned in the response or server-side resource state was mutated. |
-| `no_leak_denied_by_status` | Access control enforced: Server cleanly rejected the probe with HTTP 401, 403, or 404. |
-| `no_leak_matches_error_baseline` | Disguised denial: Server returned `200 OK`, but the body structure matched known application error responses. |
-| `no_leak_correctly_scoped` | Server returned `200 OK`, but safely served the requester's own data, ignoring the swapped ID parameter. |
-| `no_leak_state_unchanged` | Action verified: The server may have returned a success message, but the victim's resource state remained completely untouched. |
-| `ambiguous_needs_manual_review` | Valid response structure returned, but without sufficient identity markers to confirm or deny a leak. |
-| `request_failed` | Network drop, connection timeout, or host unreachable during test. |
+| -v or --verbose | Enables granular step by step logging for every tested transaction. |
+| --test-actions | Authorizes Engine 2 to evaluate state changing endpoints on test accounts. |
+| --report <file> | Designates the destination path for the structured JSON output report. |
 
 ---
 
-## 6. Exiting the Environment
+## Classification Verdict Matrix
 
-When you have finished testing, deactivate the Python virtual environment:
+| Verdict Label | Assessment Meaning |
+|---|---|
+| confirmed leak | Proven finding: Victim personal data leaked into the response or server resource state was mutated. |
+| no leak denied by status | Enforced control: Server rejected the request using HTTP status 401, 403, or 404. |
+| no leak matches error baseline | Disguised denial: Server returned status 200 OK, but the body matched known error blueprints. |
+| no leak correctly scoped | Proper tenancy: Server returned 200 OK, but safely served the requester own record, ignoring the swapped ID. |
+| no leak state unchanged | Action verified: The server returned a success message, but victim resource state remained unmodified. |
+| ambiguous needs manual review | Valid data format returned without definitive proof to confirm or refute a vulnerability. |
+| request failed | Network connectivity timeout or connection drop occurred during test execution. |
+
+---
+
+## Exiting the Environment
+
+Upon completion of assessment activities, close the virtual environment:
 ```bash
 deactivate
 ```
 
 ---
 
-## 7. Ethical Scope & Authorization
+## Authorization and Safe Testing Boundaries
 
-This tool is strictly intended for **authorized testing in controlled environments**:
-* Intentionally vulnerable testbeds (e.g., [OWASP crAPI](https://github.com/OWASP/crAPI), [VAmPI](https://github.com/erev0s/VAmPI)).
-* Academic and defensive access control research on accounts owned and controlled by the researcher.
-* Authorized penetration testing and security assessments under an explicit Rules of Engagement (RoE).
+This software is developed strictly for educational research, defensive security engineering, and authorized security assessments. Testing must be conducted exclusively against:
+
+- Local purposely vulnerable applications such as OWASP crAPI or VAmPI.
+- Accounts and applications explicitly created and owned by the tester.
+- Client environments covered by written authorization and clear Rules of Engagement.
