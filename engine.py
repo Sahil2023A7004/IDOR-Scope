@@ -1,57 +1,49 @@
-#!/usr/bin/env python3
-"""
-engine.py
-
-VSF-Mini: an automated access control leak detection engine.
-
-Takes two HAR files and runs the whole pipeline end to end:
-
-  1. Load + clean both HAR files              (har_loader.py)
-  2. Auto-match requests to the same endpoint  (matcher.py)
-  3. Pull each user's token + identity values  (token_extractor.py)
-  4. Send swapped requests and classify them   (prober.py, classifier.py)
-     - GET endpoints -> Engine 1 (response-based leak detection)
-     - state-changing endpoints -> Engine 2 (before/after verification,
-       only runs with --test-actions since it performs real actions)
-  6. Print a results table + save a JSON report
-
-Usage:
-    python3 engine.py alice.har bob.har
-    python3 engine.py alice.har bob.har -v
-    python3 engine.py alice.har bob.har --test-actions
-    python3 engine.py alice.har bob.har --report findings.json
-"""
+#The master orchestrator for IDOR-Scope.
+#Takes two HAR files and runs the full automated pipeline end to end:
+#1. Load and clean both HAR captures (har_loader.py)
+#2. Match identical endpoints differing by one resource ID (matcher.py)
+#3. Extract auth credentials, JWT claims, and identity markers (token_extractor.py)
+#4. Probe and classify read endpoints with Engine 1 (prober.py, classifier.py)
+#5. Verify state changing endpoints with Engine 2 (action_verifier.py, classifier.py)
+#6. Print an aligned console summary table and save a JSON report
 
 import sys
 import os
 import json
 import argparse
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))#Ensure local modules import cleanly
 
 from har_loader import load_clean, load_har
 from matcher import find_matches
-from token_extractor import extract_bearer_token, extract_identity_values
-from prober import run_pair_probe, build_swapped_url, send_probe
+from token_extractor import extract_auth, claims_from_jwt, extract_identity_values
+from prober import run_pair_probe, build_swapped_url, build_swapped_body, send_probe
 from classifier import build_error_baseline, classify, classify_action
 from action_verifier import is_state_changing, verify_action_swap
 
 
-def shorten(text, max_length):
+def shorten(text, max_length):#Truncate long strings cleanly for table display
     if len(text) <= max_length:
         return text
     return text[:max_length - 3] + "..."
 
 
-def shorten_token(token):
-    """Show just enough of a token to recognize it, never the full thing."""
-    if not token:
+def shorten_auth(auth):#Display auth type and a masked preview of the credential
+    if not auth:
         return "(none)"
-    return token[:16] + "..." + token[-6:]
+    if isinstance(auth, dict):
+        auth_type = auth.get("type", "unknown")
+        val = auth.get("value", "")
+    else:
+        auth_type = "bearer"
+        val = str(auth)
+
+    if len(val) <= 24:
+        return f"[{auth_type}] {val}"
+    return f"[{auth_type}] {val[:16]}...{val[-6:]}"
 
 
-def print_results_table(rows):
-    """Print a clean, aligned results table instead of scattered prints."""
+def print_results_table(rows):#Print an aligned summary table of all probe verdicts
     col_widths = {"endpoint": 42, "direction": 20, "status": 8, "verdict": 30, "confidence": 10}
 
     header = (
@@ -64,7 +56,7 @@ def print_results_table(rows):
     print(header)
     print("-" * len(header))
 
-    for row in rows:
+    for row in rows:#Print each test direction as one formatted row
         print(
             f"{shorten(row['endpoint'], col_widths['endpoint']):<{col_widths['endpoint']}} "
             f"{row['direction']:<{col_widths['direction']}} "
@@ -74,14 +66,14 @@ def print_results_table(rows):
         )
 
 
-def run_read_match(match, token_a, token_b, identity_a, identity_b, baseline_schemas, verbose):
-    """Engine 1: swap + classify a GET (read-type) match."""
+def run_read_match(match, auth_a, auth_b, identity_a, identity_b, baseline_schemas, verbose):#Engine 1 pipeline
     endpoint_label = f"{match.method} {match.path_template}"
 
     if verbose:
-        print(f"\n  [verbose] probing (read): {endpoint_label}")
+        print(f"\n  [verbose] probing (read): {endpoint_label} (diff in {match.diff_location})")
 
-    probe_results = run_pair_probe(match, token_a, token_b)
+    #Step 1 Fire swapped requests in both directions
+    probe_results = run_pair_probe(match, auth_a, auth_b)
 
     if verbose:
         print(f"    A's creds -> B's resource: "
@@ -89,6 +81,7 @@ def run_read_match(match, token_a, token_b, identity_a, identity_b, baseline_sch
         print(f"    B's creds -> A's resource: "
               f"{probe_results['b_credentials_a_resource']['swapped_url']}")
 
+    #Step 2 Run responses through the four signal classifier cascade
     verdict_a_to_b = classify(
         probe_results["a_credentials_b_resource"]["response"],
         baseline_schemas, identity_b,
@@ -123,6 +116,7 @@ def run_read_match(match, token_a, token_b, identity_a, identity_b, baseline_sch
         "type": "read",
         "endpoint": endpoint_label,
         "diff_location": match.diff_location,
+        "diff_key": match.diff_key,
         "id_value_a": match.id_value_a,
         "id_value_b": match.id_value_b,
         "a_credentials_b_resource": {
@@ -142,26 +136,50 @@ def run_read_match(match, token_a, token_b, identity_a, identity_b, baseline_sch
     return table_rows, report_entry
 
 
-def run_action_match(match, token_a, token_b, verbose):
-    """Engine 2: before/after verification for a state-changing match."""
+def run_action_match(match, auth_a, auth_b, verbose):#Engine 2 before and after state verification
     endpoint_label = f"{match.method} {match.path_template}"
 
     if verbose:
-        print(f"\n  [verbose] verifying (action): {endpoint_label}")
+        print(f"\n  [verbose] verifying (action): {endpoint_label} (diff in {match.diff_location})")
 
-    url_a_to_b = build_swapped_url(match.request_a["url"], match.diff_location,
-                                    match.diff_index, match.diff_key, match.id_value_b)
-    url_b_to_a = build_swapped_url(match.request_b["url"], match.diff_location,
-                                    match.diff_index, match.diff_key, match.id_value_a)
+    #Step 1 Build swapped URLs for both directions
+    url_a_to_b = build_swapped_url(
+        match.request_a["url"], match.diff_location,
+        match.diff_index, match.diff_key, match.id_value_b
+    )
+    url_b_to_a = build_swapped_url(
+        match.request_b["url"], match.diff_location,
+        match.diff_index, match.diff_key, match.id_value_a
+    )
 
-    send_a_to_b = lambda: send_probe(url_a_to_b, token_a, method=match.method,
-                                      body=match.request_a.get("body"))
-    send_b_to_a = lambda: send_probe(url_b_to_a, token_b, method=match.method,
-                                      body=match.request_b.get("body"))
+    #Step 2 Build swapped bodies if the differing ID lives inside the JSON payload
+    body_a_to_b = match.request_a.get("body")
+    body_b_to_a = match.request_b.get("body")
+    if match.diff_location == "body":
+        body_a_to_b = build_swapped_body(match.request_a.get("body"), match.diff_key, match.id_value_b)
+        body_b_to_a = build_swapped_body(match.request_b.get("body"), match.diff_key, match.id_value_a)
 
-    result_a_to_b = verify_action_swap(match.request_b["url"], token_b, send_a_to_b)
-    result_b_to_a = verify_action_swap(match.request_a["url"], token_a, send_b_to_a)
+    #Step 3 Prepare callbacks that fire the swapped action with browser headers
+    send_a_to_b = lambda: send_probe(
+        url_a_to_b, auth_a, method=match.method,
+        body=body_a_to_b, original_headers=match.request_a.get("headers")
+    )
+    send_b_to_a = lambda: send_probe(
+        url_b_to_a, auth_b, method=match.method,
+        body=body_b_to_a, original_headers=match.request_b.get("headers")
+    )
 
+    #Step 4 Snapshot before state, execute action, snapshot after state, and compare
+    result_a_to_b = verify_action_swap(
+        match.request_b["url"], auth_b, send_a_to_b,
+        original_headers=match.request_b.get("headers")
+    )
+    result_b_to_a = verify_action_swap(
+        match.request_a["url"], auth_a, send_b_to_a,
+        original_headers=match.request_a.get("headers")
+    )
+
+    #Step 5 Classify whether server state mutated
     verdict_a_to_b = classify_action(result_a_to_b)
     verdict_b_to_a = classify_action(result_b_to_a)
 
@@ -188,6 +206,7 @@ def run_action_match(match, token_a, token_b, verbose):
         "type": "action",
         "endpoint": endpoint_label,
         "diff_location": match.diff_location,
+        "diff_key": match.diff_key,
         "id_value_a": match.id_value_a,
         "id_value_b": match.id_value_b,
         "a_credentials_b_resource": {**result_a_to_b, "verdict": verdict_a_to_b},
@@ -197,8 +216,8 @@ def run_action_match(match, token_a, token_b, verbose):
     return table_rows, report_entry
 
 
-def main():
-    parser = argparse.ArgumentParser(description="VSF-Mini access control leak detection engine")
+def main():#CLI entry point that coordinates all modules
+    parser = argparse.ArgumentParser(description="IDOR-Scope automated access control leak detection engine")
     parser.add_argument("har_a", help="HAR file for user A (e.g. alice.har)")
     parser.add_argument("har_b", help="HAR file for user B (e.g. bob.har)")
     parser.add_argument("--report", default="findings.json", help="Output JSON report path")
@@ -212,9 +231,9 @@ def main():
     verbose = args.verbose
 
     print(f"Loading {args.har_a} and {args.har_b}...")
-    all_requests_a = load_har(args.har_a)
+    all_requests_a = load_har(args.har_a)#All traffic for error baseline learning
     all_requests_b = load_har(args.har_b)
-    clean_requests_a = load_clean(args.har_a)
+    clean_requests_a = load_clean(args.har_a)#Filtered API traffic for matching
     clean_requests_b = load_clean(args.har_b)
 
     print(f"  User A: {len(all_requests_a)} total, "
@@ -224,24 +243,32 @@ def main():
           f"{len(all_requests_b) - len(clean_requests_b)} removed as junk, "
           f"{len(clean_requests_b)} remain")
 
-    token_a = extract_bearer_token(clean_requests_a)
-    token_b = extract_bearer_token(clean_requests_b)
-    if not token_a or not token_b:
-        print("ERROR: couldn't find a Bearer token for one or both users.")
+    #Extract session credentials (Bearer token or Cookie) for both users
+    auth_a = extract_auth(clean_requests_a)
+    auth_b = extract_auth(clean_requests_b)
+    if not auth_a or not auth_b:
+        print("ERROR: couldn't find a Bearer token or Cookie session for one or both users.")
         sys.exit(1)
 
+    #Extract personal identity values from responses and merge JWT payload claims
     identity_a = extract_identity_values(clean_requests_a)
     identity_b = extract_identity_values(clean_requests_b)
+    if auth_a.get("type") == "bearer":
+        identity_a |= claims_from_jwt(auth_a.get("value"))
+    if auth_b.get("type") == "bearer":
+        identity_b |= claims_from_jwt(auth_b.get("value"))
 
     if verbose:
-        print(f"\n  [verbose] user A token: {shorten_token(token_a)}")
-        print(f"  [verbose] user B token: {shorten_token(token_b)}")
+        print(f"\n  [verbose] user A auth: {shorten_auth(auth_a)}")
+        print(f"  [verbose] user B auth: {shorten_auth(auth_b)}")
         print(f"  [verbose] user A identity values found: {identity_a or '(none found)'}")
         print(f"  [verbose] user B identity values found: {identity_b or '(none found)'}")
 
+    #Build error response shape baselines from 401 403 and 404 responses
     baseline_schemas = build_error_baseline(all_requests_a + all_requests_b)
     print(f"\n  Collected {len(baseline_schemas)} known 'denied' response shapes")
 
+    #Find matched endpoints that differ by a single candidate ID
     matches = find_matches(clean_requests_a, clean_requests_b)
     read_matches = [m for m in matches if not is_state_changing(m.method)]
     action_matches = [m for m in matches if is_state_changing(m.method)]
@@ -257,12 +284,16 @@ def main():
     table_rows = []
     full_report = []
 
+    #Run Engine 1 on all read endpoints
     for match in read_matches:
-        rows, entry = run_read_match(match, token_a, token_b, identity_a, identity_b,
-                                      baseline_schemas, verbose)
+        rows, entry = run_read_match(
+            match, auth_a, auth_b, identity_a, identity_b,
+            baseline_schemas, verbose
+        )
         table_rows += rows
         full_report.append(entry)
 
+    #Run Engine 2 on state changing endpoints if --test-actions is enabled
     for match in action_matches:
         endpoint_label = f"{match.method} {match.path_template}"
         if not args.test_actions:
@@ -274,7 +305,7 @@ def main():
                 "status": "skipped_pending_test_actions_flag",
             })
             continue
-        rows, entry = run_action_match(match, token_a, token_b, verbose)
+        rows, entry = run_action_match(match, auth_a, auth_b, verbose)
         table_rows += rows
         full_report.append(entry)
 
@@ -285,7 +316,7 @@ def main():
         print("(no endpoints were actually tested - action-type candidates "
               "were skipped; re-run with --test-actions)")
 
-    with open(args.report, "w") as f:
+    with open(args.report, "w", encoding="utf-8") as f:
         json.dump(full_report, f, indent=2)
 
     leak_count = sum(1 for row in table_rows if row["verdict"] == "confirmed_leak")
@@ -295,3 +326,31 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# Libraries Used:
+
+# sys and os (builtin) configure module import paths and handle exit codes
+# json (builtin) writes the final findings report to disk in structured JSON format
+# argparse (builtin) parses command line flags like --verbose, --report, and --test-actions
+
+# Variables Used:
+
+# all_requests_a / all_requests_b hold unfiltered HAR traffic used to learn error shapes
+# clean_requests_a / clean_requests_b hold filtered API requests used for matching and probing
+# auth_a / auth_b store extracted session credentials as {"type": "bearer"|"cookie", "value": ...}
+# identity_a / identity_b store sets of personal markers (emails, phones, usernames, JWT claims)
+# baseline_schemas holds the list of error response shapes learned from 401/403/404 traffic
+# read_matches / action_matches separate GET probes (Engine 1) from state-changing probes (Engine 2)
+# table_rows / full_report collect console summary rows and detailed JSON output entries
+
+# Working:
+
+# main parses CLI arguments and calls har_loader to build raw and cleaned request lists
+# token_extractor pulls each user's Bearer token or Cookie and extracts personal identity markers
+# If the credential is a JWT Bearer token claims_from_jwt merges decoded claims into the identity set
+# classifier builds an error baseline from all 401 403 and 404 responses across both HAR files
+# matcher compares User A and User B traffic to find endpoints differing by a single ID
+# Read candidates are sent through run_read_match (Engine 1) which swaps IDs via prober and classifies responses
+# State-changing candidates (POST/PUT/PATCH/DELETE) are sent through run_action_match (Engine 2) only if --test-actions is passed
+# Finally engine prints an aligned summary table to the terminal and writes full evidence to findings.json
